@@ -3,40 +3,63 @@
 # fetch_rpm_data_and_verify_ima_list.py: extract digests from RPMs and verify an IMA list
 #
 # Author: Roberto Sassu <rsassu@suse.de>
+#
+# This library is free software; you can redistribute it and/or
+# modify it under the terms of the GNU Lesser General Public
+# License as published by the Free Software Foundation; either
+# version 2.1 of the License, or (at your option) any later version.
+#
+# This library is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+# Lesser General Public License for more details.
+#
+# You should have received a copy of the GNU Lesser General Public
+# License along with this library.  If not, see
+# <http://www.gnu.org/licenses/>.
 
 import os
 import sys
 import struct
 import gevent
+import getopt
 from gevent import monkey
 
 monkey.patch_all()
 
 import httplib
 
-repos = [
-'/update/13.2/',
-'/distribution/13.2/repo/oss/suse',
-'/update/13.2-non-oss/',
-'/distribution/13.2/repo/non-oss/suse',
+
+default_repos_url = [
+'http://download.opensuse.org/update/13.2/',
+'http://download.opensuse.org/update/13.2-non-oss/',
+'http://download.opensuse.org/distribution/13.2/repo/oss/suse',
+'http://download.opensuse.org/distribution/13.2/repo/non-oss/suse',
 ]
 
 digests = []
 
-def init_connection(server):
-    return httplib.HTTPConnection(server)
+
+def init_connections(repos, repo_urls, mirror_distro_root):
+    for repo_url in repo_urls:
+        repo_url = repo_url.replace('http://download.opensuse.org', mirror_distro_root)
+        server = repo_url.split('/')[2:3][0]
+        if server not in repos:
+            repos[server] = [httplib.HTTPConnection(server)]
+
+        repos[server].append('/'.join(repo_url.split('/')[3:]))
 
 
-def fetch_data(conn, relative_path, arch, pkg_filename, url_offset, size):
-    for repo in repos:
-        conn.request("GET", '%s/%s/%s/%s' % (relative_path, repo, arch, pkg_filename),
-                     headers={'Range': 'bytes=%s-%s' % (url_offset, url_offset + size),
-                              'Connection': 'keep-alive'})
-        resp = conn.getresponse()
-        data = resp.read()
-        if resp.status == 206:
-            return data
-
+def fetch_data(repos, arch, pkg_filename, url_offset, size):
+    for server in repos:
+        for relative_path in repos[server][1:]:
+            repos[server][0].request("GET", '/%s/%s/%s' % (relative_path, arch, pkg_filename),
+                                     headers={'Range': 'bytes=%s-%s' % (url_offset, url_offset + size),
+                                              'Connection': 'keep-alive'})
+            resp = repos[server][0].getresponse()
+            data = resp.read()
+            if resp.status == 206:
+                return data
     return ''
 
 
@@ -51,18 +74,21 @@ def chunks(l, n):
         yield l[i:i+n]
 
 
-def main(server, relative_path, packages):
-    conn = init_connection(server)
+def main(packages, repo_urls, mirror_distro_root):
+    repos = {}
     total_packages = len(packages)
     count = 1
+
+    init_connections(repos, repo_urls, mirror_distro_root)
 
     for pkg in packages:
         #print 'Processing (%d/%d): %s' % (count, total_packages, pkg)
 
         pkg_arch = pkg.split('.')[-1]
-        rpm_str = fetch_data(conn, relative_path, pkg_arch, '%s.rpm' % pkg, 96, 6000)
+        rpm_str = fetch_data(repos, pkg_arch, '%s.rpm' % pkg, 96, 6000)
         if len(rpm_str) == 0:
             print 'Error: %s - signature header' % pkg
+            count += 1
             continue
 
         offset = 0
@@ -87,12 +113,13 @@ def main(server, relative_path, packages):
 
         if file_digest_entry is None:
             print 'Error - digests: %s' % pkg
+            count += 1
             continue
 
         digests_data_offset = num_header_entries * 16 + file_digest_entry[2]
         digests_data_length = file_digest_entry[3] * 33
         if len(rpm_str) <  digests_data_offset + digests_data_length:
-            rpm_str = fetch_data(conn, relative_path, pkg_arch, '%s.rpm' % pkg, 96 + offset + digests_data_offset, digests_data_length)
+            rpm_str = fetch_data(repos, pkg_arch, '%s.rpm' % pkg, 96 + offset + digests_data_offset, digests_data_length)
             if len(rpm_str) == 0:
                 print 'Error: %s - file digests' % pkg
         else:
@@ -110,11 +137,69 @@ def main(server, relative_path, packages):
         count += 1
 
 
-# syntax: ./fetch_rpm_data_and_verify_ima_list.py <repository server> <repository relative path> <IMA measurements> <output of 'rpm -qa'>
+def usage():
+    print 'Syntax: %s -i <ima measurements> -p <packages> -r <repositories> -m <mirror distribution root>' % sys.argv[0]
+
+
 if __name__ == '__main__':
+    ima_measurements_path = None
+    packages_path = None
+    repo_urls_path = None
+    mirror_distro_root = None
+    threads = 1
+
+    try:
+        opts, args = getopt.getopt(sys.argv[1:], "i:p:r:t:m:")
+    except getopt.GetoptError:
+        usage()
+        sys.exit(2)
+
+    for opt, arg in opts:
+        if opt in ('-h', '--help'):
+            usage()
+            sys.exit()
+        elif opt in ('-i', '--ima-measurements'):
+            ima_measurements_path = arg
+        elif opt in ('-p', '--packages'):
+            packages_path = arg
+        elif opt in ('-r', '--repositories'):
+            repo_urls_path = arg
+        elif opt in ('-t', '--threads'):
+            threads = int(arg)
+        elif opt in ('-m', '--mirror-distro-root'):
+            mirror_distro_root = arg
+
+    repos_url = default_repos_url
+    if repo_urls_path is not None:
+        try:
+            fd = open(repo_urls_path, 'r')
+            repos_url_str = fd.read()
+            repos_url = repos_url_str.split('\n')
+        except:
+            pass
+
+    packages = []
+    if packages_path is not None:
+        try:
+            fd = open(packages_path, 'r')
+            packages_str = fd.read()
+            for pkg in packages_str.split('\n'):
+                if len(pkg) > 0:
+                    packages.append(pkg)
+        except:
+            pass
+
+    if mirror_distro_root is None:
+        print 'Please specify a mirror from http://mirrors.opensuse.org/'
+        sys.exit(1)
+
     # create a database of known digest values
-    jobs = [gevent.spawn(main, sys.argv[1], sys.argv[2], pkgs) for pkgs in list(chunks(sys.argv[4:], 25))]
+    jobs = [gevent.spawn(main, packages_chunk, repos_url, mirror_distro_root) \
+            for packages_chunk in list(chunks(packages, len(packages) / threads))]
     gevent.joinall(jobs)
+
+    if ima_measurements_path is None:
+        sys.exit(0)
 
     # check the IMA file list and display the lines with digests not recognized
     fd = open(sys.argv[3], 'r')
