@@ -33,16 +33,17 @@ import httplib
 default_repos_url = [
 'http://download.opensuse.org/update/13.2/',
 'http://download.opensuse.org/update/13.2-non-oss/',
-'http://download.opensuse.org/distribution/13.2/repo/oss/suse',
-'http://download.opensuse.org/distribution/13.2/repo/non-oss/suse',
+'http://download.opensuse.org/distribution/13.2/repo/oss/suse/',
+'http://download.opensuse.org/distribution/13.2/repo/non-oss/suse/',
 ]
 
 digests = []
 
+HTTP_GET_MAX_ATTEMPTS = 3
 
-def init_connections(repos, repo_urls, mirror_distro_root):
+
+def init_connections(repos, repo_urls):
     for repo_url in repo_urls:
-        repo_url = repo_url.replace('http://download.opensuse.org', mirror_distro_root)
         server = repo_url.split('/')[2:3][0]
         if server not in repos:
             repos[server] = [httplib.HTTPConnection(server)]
@@ -50,16 +51,42 @@ def init_connections(repos, repo_urls, mirror_distro_root):
         repos[server].append('/'.join(repo_url.split('/')[3:]))
 
 
-def fetch_data(repos, arch, pkg_filename, url_offset, size):
+def fetch_data(repos, arch, pkg_filename, url_offset, size, mirror_distro_root):
+    new_repo_urls = []
+
     for server in repos:
         for relative_path in repos[server][1:]:
-            repos[server][0].request("GET", '/%s/%s/%s' % (relative_path, arch, pkg_filename),
-                                     headers={'Range': 'bytes=%s-%s' % (url_offset, url_offset + size),
-                                              'Connection': 'keep-alive'})
-            resp = repos[server][0].getresponse()
-            data = resp.read()
+            attempts = 0
+            while attempts < HTTP_GET_MAX_ATTEMPTS:
+                try:
+                    repos[server][0].request("GET", '/%s/%s/%s' % (relative_path, arch, pkg_filename),
+                                            headers={'Range': 'bytes=%s-%s' % (url_offset, url_offset + size),
+                                                    'Connection': 'keep-alive'})
+                    resp = repos[server][0].getresponse()
+                    data = resp.read()
+                    break
+                except Exception as e:
+                    repos[server][0].close()
+                    repos[server][0] = httplib.HTTPConnection(server)
+                    attempts += 1
+                    continue
+
             if resp.status == 206:
                 return data
+            elif resp.status == 302:
+                repos[server].remove(relative_path)
+                if mirror_distro_root is None:
+                    redirect_url = resp.getheader('Location')
+                    mirror_distro_root = redirect_url[:redirect_url.index(relative_path)]
+
+                new_repo_url = mirror_distro_root + relative_path
+                #print 'Server: %s, relative path: %s, redirect to: %s' % (server, relative_path, new_repo_url)
+                new_repo_urls.append(new_repo_url)
+
+    if len(new_repo_urls) > 0:
+        init_connections(repos, new_repo_urls)
+        return fetch_data(repos, arch, pkg_filename, url_offset, size, mirror_distro_root)
+
     return ''
 
 
@@ -79,13 +106,13 @@ def main(packages, repo_urls, mirror_distro_root):
     total_packages = len(packages)
     count = 1
 
-    init_connections(repos, repo_urls, mirror_distro_root)
+    init_connections(repos, repo_urls)
 
     for pkg in packages:
         #print 'Processing (%d/%d): %s' % (count, total_packages, pkg)
 
         pkg_arch = pkg.split('.')[-1]
-        rpm_str = fetch_data(repos, pkg_arch, '%s.rpm' % pkg, 96, 6000)
+        rpm_str = fetch_data(repos, pkg_arch, '%s.rpm' % pkg, 96, 6000, mirror_distro_root)
         if len(rpm_str) == 0:
             print 'Error: %s - signature header' % pkg
             count += 1
@@ -119,7 +146,7 @@ def main(packages, repo_urls, mirror_distro_root):
         digests_data_offset = num_header_entries * 16 + file_digest_entry[2]
         digests_data_length = file_digest_entry[3] * 33
         if len(rpm_str) <  digests_data_offset + digests_data_length:
-            rpm_str = fetch_data(repos, pkg_arch, '%s.rpm' % pkg, 96 + offset + digests_data_offset, digests_data_length)
+            rpm_str = fetch_data(repos, pkg_arch, '%s.rpm' % pkg, 96 + offset + digests_data_offset, digests_data_length, mirror_distro_root)
             if len(rpm_str) == 0:
                 print 'Error: %s - file digests' % pkg
         else:
@@ -171,10 +198,13 @@ if __name__ == '__main__':
 
     repos_url = default_repos_url
     if repo_urls_path is not None:
+        repos_url = []
         try:
             fd = open(repo_urls_path, 'r')
             repos_url_str = fd.read()
-            repos_url = repos_url_str.split('\n')
+            for repo_url_str in repos_url_str.split('\n'):
+                if len(repo_url_str) > 0:
+                    repos_url.append(repo_url_str)
         except:
             pass
 
@@ -189,10 +219,6 @@ if __name__ == '__main__':
         except:
             pass
 
-    if mirror_distro_root is None:
-        print 'Please specify a mirror from http://mirrors.opensuse.org/'
-        sys.exit(1)
-
     # create a database of known digest values
     jobs = [gevent.spawn(main, packages_chunk, repos_url, mirror_distro_root) \
             for packages_chunk in list(chunks(packages, len(packages) / threads))]
@@ -202,9 +228,9 @@ if __name__ == '__main__':
         sys.exit(0)
 
     # check the IMA file list and display the lines with digests not recognized
-    fd = open(sys.argv[3], 'r')
+    fd = open(ima_measurements_path, 'r')
     report = fd.read()
     fd.close()
     for line in report.split('\n')[:-1]:
-        if line.split()[3][:32] not in digests:
+        if line.split()[3][4:] not in digests:
             print line
